@@ -4,3 +4,5 @@ pynput
 psutil
 pystray
 Pillow
+pygetwindow
+pyperclip
