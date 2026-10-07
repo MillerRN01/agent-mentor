@@ -1,0 +1,6 @@
+PySide6
+httpx
+pynput
+psutil
+pystray
+Pillow
