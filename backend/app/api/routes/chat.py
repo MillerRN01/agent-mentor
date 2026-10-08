@@ -25,6 +25,8 @@ provider = OllamaProvider(
 class ContextData(BaseModel):
     application: str | None = None
     window_title: str | None = None
+    editor: str | None = None
+    filename: str | None = None
     language: str | None = None
     selected_text: str | None = None
     file_path: str | None = None
@@ -47,6 +49,35 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     conversation_id: str
+    context_used: dict | None = None
+
+
+def build_context_prompt(context: ContextData | None) -> str:
+    """Monta um prompt com informações do contexto do usuário."""
+    if not context:
+        return ""
+    
+    parts = []
+    
+    if context.editor and context.editor != "Desconhecido":
+        parts.append(f"Editor/IDE: {context.editor}")
+    
+    if context.filename and context.filename != "Sem arquivo":
+        parts.append(f"Arquivo: {context.filename}")
+    
+    if context.language and context.language != "unknown":
+        parts.append(f"Linguagem: {context.language}")
+    
+    if context.window_title:
+        parts.append(f"Contexto: {context.window_title}")
+    
+    if context.selected_text:
+        parts.append(f"Texto selecionado:\n```\n{context.selected_text}\n```")
+    
+    if parts:
+        return "Contexto do usuário:\n" + "\n".join(parts) + "\n"
+    
+    return ""
 
 
 @router.get("/health")
@@ -70,18 +101,13 @@ async def chat(request: ChatRequest) -> ChatResponse:
         f"{item['role']}: {item['content']}" for item in history
     )
 
-    context_text = ""
-    if request.context:
-        context_text = "\nContexto do aplicativo:\n" + "\n".join(
-            f"{key}: {value}"
-            for key, value in request.context.model_dump().items()
-            if value
-        )
+    context_text = build_context_prompt(request.context)
 
     prompt = (
         "Você é o Agent Mentor, um assistente útil para programação. "
-        "Responda em português do Brasil, salvo se o usuário pedir outro idioma.\n\n"
-        f"{context_text}\n\n"
+        "Responda em português do Brasil, salvo se o usuário pedir outro idioma. "
+        "Seja preciso, conciso e útil.\n\n"
+        f"{context_text}"
         f"Histórico:\n{history_text}\n\nAssistente:"
     )
 
@@ -91,7 +117,12 @@ async def chat(request: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     save_message(conversation_id, "assistant", response)
-    return ChatResponse(response=response, conversation_id=conversation_id)
+    
+    return ChatResponse(
+        response=response,
+        conversation_id=conversation_id,
+        context_used=request.context.model_dump() if request.context else None,
+    )
 
 
 @router.get("/conversations")
