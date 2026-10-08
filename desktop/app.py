@@ -1,135 +1,152 @@
-import sys
-import threading
+from typing import Annotated
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton, QTextEdit, QVBoxLayout, QWidget
-from PIL import Image, ImageDraw
-import pystray
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field, field_validator
 
-from api_client import AgentClient
-from context import get_app_context
-from hotkeys import GlobalHotkey
-
-
-class AgentWindow(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Agent Mentor")
-        self.resize(420, 520)
-        self.setMinimumWidth(360)
-
-        self.client = AgentClient("http://localhost:8000")
-        self.conversation_id = None
-
-        self.chat_log = QTextEdit()
-        self.chat_log.setReadOnly(True)
-        self.chat_log.setPlaceholderText("Conversa do Agent Mentor")
-        self.chat_log.setStyleSheet(
-            """
-            QTextEdit {
-                background: #f8fafc;
-                border: 1px solid #cbd5e1;
-                border-radius: 10px;
-                padding: 10px;
-                font-size: 13px;
-            }
-            """
-        )
-
-        self.input_box = QLineEdit()
-        self.input_box.setPlaceholderText("Digite sua mensagem...")
-        self.input_box.returnPressed.connect(self.send_message)
-
-        self.send_button = QPushButton("Enviar")
-        self.send_button.clicked.connect(self.send_message)
-
-        self.status_label = QLabel("Status: aguardando...")
-        self.status_label.setStyleSheet("color: #334155; font-size: 11px;")
-
-        layout = QVBoxLayout()
-        layout.addWidget(QLabel("Agent Mentor"))
-        layout.addWidget(self.chat_log)
-        layout.addWidget(self.input_box)
-        layout.addWidget(self.send_button)
-        layout.addWidget(self.status_label)
-
-        self.setLayout(layout)
-
-        self.append_message("Assistente", "Olá! Eu sou o Agent Mentor. Pressione Ctrl + Alt + M para abrir.")
-
-    def append_message(self, who: str, text: str):
-        self.chat_log.append(f"{who}: {text}")
-
-    def send_message(self):
-        text = self.input_box.text().strip()
-        if not text:
-            return
-
-        self.input_box.clear()
-        self.status_label.setText("Status: enviando...")
-
-        try:
-            context = get_app_context()
-            result = self.client.chat(
-                message=text,
-                conversation_id=self.conversation_id,
-                context=context,
-            )
-            self.conversation_id = result.get("conversation_id")
-            self.append_message("Você", text)
-            self.append_message("Assistente", result.get("response", "Sem resposta"))
-            self.status_label.setText("Status: resposta recebida")
-        except Exception as exc:  # pragma: no cover
-            self.append_message("Assistente", f"Erro: {exc}")
-            self.status_label.setText("Status: erro de comunicação")
-
-    def toggle_visibility(self):
-        if self.isVisible():
-            self.hide()
-        else:
-            self.show()
-            self.raise_()
-            self.activateWindow()
+from app.core.chat_store import (
+    create_conversation,
+    delete_conversation,
+    get_messages,
+    list_conversations,
+    save_message,
+)
+from app.core.config import settings
+from app.core.database import conversation_exists
+from app.llm.ollama_provider import OllamaProvider, OllamaProviderError
 
 
-def make_icon():
-    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((8, 8, 56, 56), fill=(37, 99, 235), radius=10)
-    draw.text((18, 18), "AI", fill=(255, 255, 255))
-    return image
+router = APIRouter(prefix="/api", tags=["chat"])
+provider = OllamaProvider(
+    base_url=settings.ollama_base_url,
+    model=settings.ollama_model,
+)
 
 
-def app_exit():
-    app.quit()
+class ContextData(BaseModel):
+    application: str | None = None
+    window_title: str | None = None
+    editor: str | None = None
+    filename: str | None = None
+    language: str | None = None
+    selected_text: str | None = None
+    file_path: str | None = None
 
 
-def create_tray_icon(window: AgentWindow):
-    icon = pystray.Icon(
-        "agent_mentor",
-        make_icon(),
-        "Agent Mentor",
-        menu=pystray.Menu(
-            pystray.MenuItem("Abrir", lambda: window.toggle_visibility()),
-            pystray.MenuItem("Sair", lambda: app_exit()),
-        ),
+class ChatRequest(BaseModel):
+    message: str = Field(..., description="Mensagem do usuário")
+    conversation_id: str | None = None
+    context: ContextData | None = None
+
+    @field_validator("message")
+    @classmethod
+    def message_must_not_be_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("A mensagem não pode ficar vazia.")
+        return value
+
+
+class ChatResponse(BaseModel):
+    response: str
+    conversation_id: str
+    context_used: dict | None = None
+
+
+def build_context_prompt(context: ContextData | None) -> str:
+    """Monta um prompt com informações do contexto do usuário."""
+    if not context:
+        return ""
+
+    parts: list[str] = []
+
+    if context.application:
+        parts.append(f"Aplicação ativa: {context.application}")
+
+    if context.editor and context.editor != "Desconhecido":
+        parts.append(f"Editor/IDE: {context.editor}")
+
+    if context.filename and context.filename != "Sem arquivo":
+        parts.append(f"Arquivo atual: {context.filename}")
+
+    if context.language and context.language != "unknown":
+        parts.append(f"Linguagem: {context.language}")
+
+    if context.window_title and context.window_title != "Janela ativa não detectada":
+        parts.append(f"Título da janela: {context.window_title}")
+
+    if context.selected_text:
+        parts.append(f"Texto selecionado:\n```\n{context.selected_text}\n```")
+
+    if context.file_path:
+        parts.append(f"Caminho do arquivo: {context.file_path}")
+
+    if parts:
+        return "Contexto do usuário:\n" + "\n".join(parts) + "\n"
+
+    return ""
+
+
+@router.get("/health")
+async def health() -> dict:
+    return {"status": "ok", "service": "agent-mentor"}
+
+
+@router.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest) -> ChatResponse:
+    conversation_id = request.conversation_id
+    if conversation_id and not conversation_exists(conversation_id):
+        raise HTTPException(status_code=404, detail="Conversa não encontrada.")
+
+    if not conversation_id:
+        conversation_id = create_conversation()
+
+    save_message(conversation_id, "user", request.message)
+
+    history = get_messages(conversation_id, limit=12)
+    history_text = "\n".join(
+        f"{item['role']}: {item['content']}" for item in history
     )
-    return icon
+
+    context_text = build_context_prompt(request.context)
+    prompt = (
+        "Você é o Agent Mentor, um assistente útil para programação. "
+        "Responda em português do Brasil, salvo se o usuário pedir outro idioma. "
+        "Seja preciso, útil, direto e contextualizado ao ambiente do usuário.\n\n"
+        f"{context_text}"
+        f"Histórico:\n{history_text}\n\nAssistente:"
+    )
+
+    try:
+        response = await provider.generate(prompt)
+    except OllamaProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    save_message(conversation_id, "assistant", response)
+
+    return ChatResponse(
+        response=response,
+        conversation_id=conversation_id,
+        context_used=request.context.model_dump() if request.context else None,
+    )
 
 
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = AgentWindow()
-    tray = create_tray_icon(window)
+@router.get("/conversations")
+async def conversations() -> list[dict]:
+    return list_conversations()
 
-    hotkey = GlobalHotkey(window.toggle_visibility)
-    hotkey.start()
 
-    def tray_loop():
-        tray.run()
+@router.get("/conversations/{conversation_id}/messages")
+async def conversation_messages(
+    conversation_id: str,
+    limit: Annotated[int, Query(ge=1, le=200)] = 100,
+) -> list[dict]:
+    if not conversation_exists(conversation_id):
+        raise HTTPException(status_code=404, detail="Conversa não encontrada.")
+    return get_messages(conversation_id, limit=limit)
 
-    threading.Thread(target=tray_loop, daemon=True).start()
 
-    window.show()
-    sys.exit(app.exec())
+@router.delete("/conversations/{conversation_id}")
+async def remove_conversation(conversation_id: str) -> dict:
+    if not delete_conversation(conversation_id):
+        raise HTTPException(status_code=404, detail="Conversa não encontrada.")
+    return {"deleted": True, "conversation_id": conversation_id}
